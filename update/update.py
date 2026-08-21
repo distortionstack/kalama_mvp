@@ -19,6 +19,7 @@ build_from_source / os_package (fix_type A/C) ยังเป็น stub — ต
 
 from __future__ import annotations
 
+import json
 import operator
 import re
 import subprocess
@@ -162,6 +163,7 @@ def stage_patch(case: CaseState, workdir_root: Path) -> dict[str, Any]:
     """
     patch_cfg = case.config.get("patch")
     if patch_cfg is None:
+        case.record("patch", {"success": False, "reason": "no_patch_config"})
         raise StopPipeline(
             f"{case.cve_id}: ไม่มี patch config (dependency ไม่มี patch/ module) — ยิงไม่ได้",
             status="SKIPPED",
@@ -194,6 +196,11 @@ def stage_patch(case: CaseState, workdir_root: Path) -> dict[str, Any]:
     if install_result is None:
         fallback_strategy = patch_cfg.get("upstream_fallback_strategy")
         if fallback_strategy is None:
+            case.record("patch", {
+                "success": False,
+                "reason": "no_upstream_fallback_strategy",
+                "attempts": attempt_log,
+            })
             raise StopPipeline(
                 f"{case.cve_id}: fixed_version_strategy ล้มเหลว และไม่มี upstream_fallback_strategy",
                 status="STOPPED",
@@ -209,6 +216,11 @@ def stage_patch(case: CaseState, workdir_root: Path) -> dict[str, Any]:
                 latest_version = verified[0]["actual_version_installed"]
                 print(f"  [WARN] latest_version_lookup ล้มเหลว — ใช้ verified_case ที่เคย manual-confirm: {latest_version}")
             else:
+                case.record("patch", {
+                    "success": False,
+                    "reason": "no_resolvable_upstream_version",
+                    "attempts": attempt_log,
+                })
                 raise StopPipeline(
                     f"{case.cve_id}: resolve latest upstream version ไม่ได้ และไม่มี verified_case ให้ fallback",
                     status="STOPPED",
@@ -218,6 +230,11 @@ def stage_patch(case: CaseState, workdir_root: Path) -> dict[str, Any]:
         result = _try_strategy("upstream_fallback", fallback_strategy, latest_version, workdir)
         attempt_log.append(result)
         if not result.get("success"):
+            case.record("patch", {
+                "success": False,
+                "reason": "upstream_fallback_install_failed",
+                "attempts": attempt_log,
+            })
             raise StopPipeline(
                 f"{case.cve_id}: ทั้ง fixed_version และ upstream_fallback strategy ล้มเหลว",
                 status="STOPPED",
@@ -232,11 +249,27 @@ def stage_patch(case: CaseState, workdir_root: Path) -> dict[str, Any]:
     dockerfile_path = _write_dockerfile(case.cve_id, workdir_root, install_result, build_cfg, patch_cfg, used_version)
     image_tag = f"kalama-patched-{case.cve_id.lower()}-{used_version}"
 
+    # build context ต้องเป็น workdir_root/<cve_id>/ (parent ร่วมของ patch_build/
+    # กับ patch_workdir/) ไม่ใช่ dockerfile_path.parent (patch_build/ เฉยๆ) —
+    # patch_workdir เป็น sibling ของ patch_build ไม่ใช่ลูก ถ้าใช้ patch_build/
+    # เป็น context เฉยๆ COPY patch_workdir จะหาไม่เจอ (ยืนยันจาก build จริงที่ fail)
+    build_context = workdir_root / case.cve_id
     build_result = run(
-        ["docker", "build", "-t", image_tag, str(dockerfile_path.parent)],
+        ["docker", "build", "-t", image_tag, "-f", str(dockerfile_path), str(build_context)],
         "docker build patched image",
     )
     if build_result.returncode != 0:
+        case.record("patch", {
+            "success": False,
+            "reason": "docker_build_failed",
+            "used_strategy": used_strategy,
+            "used_version": used_version,
+            "attempts": attempt_log,
+            "install_result": install_result,
+            "dockerfile_path": str(dockerfile_path),
+            "build_context": str(build_context),
+            "build_stderr_tail": build_result.stderr[-2000:],
+        })
         raise StopPipeline(
             f"{case.cve_id}: docker build patched image ล้มเหลว",
             status="STOPPED",
@@ -262,8 +295,13 @@ def _write_dockerfile(
     cve_id: str, workdir_root: Path, install_result: dict[str, Any],
     build_cfg: dict[str, Any], patch_cfg: dict[str, Any], version: str,
 ) -> Path:
-    """สร้าง Dockerfile ธรรมดา ไม่ generate logic ซับซ้อน — field มาจาก
-    build_cfg.required_config_overrides ทั้งหมด (โค้ดไม่ hardcode config เอง)
+    """สร้าง Dockerfile ธรรมดา ไม่ generate logic ซับซ้อน — field มาจาก build_cfg
+    ทั้งหมด (โค้ดไม่ hardcode ชื่อ user/entrypoint/path เอง) รองรับ:
+        runtime_user              — groupadd/useradd/chown + USER ก่อน ENTRYPOINT
+        add_install_bin_to_path   — ENV PATH=<install_path>/bin:$PATH
+        config_file_relpath       — ปลายทางจริงที่ known_config_overrides_required เขียนทับ
+        entrypoint                — คำสั่ง start จริง (list ของ argv, exec form)
+    ทุก field เป็น optional — ถ้าไม่ใส่ พฤติกรรมเดิม (ไม่มี user switch/entrypoint) ไม่เปลี่ยน
     """
     base_image = build_cfg.get("base_image", "debian:bookworm-slim")
     install_path = build_cfg.get("install_path", "/opt/app")
@@ -275,15 +313,46 @@ def _write_dockerfile(
         if _eval_applies_when(applies_when, major_version):
             overrides_lines.append(f'echo "{override["key"]}: {override["value"]}"')
 
-    config_append = " && ".join(overrides_lines) if overrides_lines else "true"
+    dockerfile_lines = [f"FROM {base_image}", f"COPY patch_workdir {install_path}"]
+
+    runtime_user = build_cfg.get("runtime_user")
+    if runtime_user:
+        name, uid, gid = runtime_user["name"], runtime_user["uid"], runtime_user["gid"]
+        dockerfile_lines.append(
+            f"RUN groupadd -g {gid} {name} "
+            f"&& useradd -u {uid} -g {gid} -d {install_path} -s /bin/bash {name} "
+            f"&& chown -R {name}:{name} {install_path}"
+        )
+
+    if build_cfg.get("add_install_bin_to_path"):
+        dockerfile_lines.append(f"ENV PATH={install_path}/bin:$PATH")
+
+    if overrides_lines:
+        config_file_relpath = build_cfg.get("config_file_relpath")
+        if not config_file_relpath:
+            raise StopPipeline(
+                f"{cve_id}: build_cfg มี known_config_overrides_required แต่ไม่มี "
+                f"'config_file_relpath' บอกว่าต้องเขียนทับไฟล์ config ไหน — เพิ่ม field นี้ใน "
+                f"patch YAML ก่อน ไม่งั้น override จะหายเงียบๆ (echo ทิ้งเฉยๆ ไม่ถูกเขียนจริง)",
+                status="STOPPED",
+                evidence={"overrides_pending": overrides_lines},
+            )
+        config_file_path = f"{install_path}/{config_file_relpath}"
+        echo_block = "; ".join(overrides_lines) + ";"
+        dockerfile_lines.append(f"RUN {{ {echo_block} }} >> {config_file_path}")
+
+    if runtime_user:
+        dockerfile_lines.append(f"USER {runtime_user['name']}")
+
+    entrypoint = build_cfg.get("entrypoint")
+    if entrypoint:
+        dockerfile_lines.append(f"ENTRYPOINT {json.dumps(entrypoint)}")
+
+    content = "\n".join(dockerfile_lines) + "\n"
 
     dockerfile_dir = workdir_root / cve_id / "patch_build"
     dockerfile_dir.mkdir(parents=True, exist_ok=True)
 
-    content = f"""FROM {base_image}
-COPY patch_workdir {install_path}
-RUN {config_append}
-"""
     dockerfile_path = dockerfile_dir / "Dockerfile"
     dockerfile_path.write_text(content)
     return dockerfile_path

@@ -10,8 +10,10 @@ attack ทำหน้าที่ exploit+oracle, patch ทำหน้าท�
 
 from __future__ import annotations
 
+import operator
+import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from ..core import (
     SCRIPT_DIR, CVE_META_DIR, ATTACK_DIR, PATCH_DIR,
@@ -21,6 +23,74 @@ from ..core import (
 
 _VALID_DEPLOYMENT_MODES = ("single_image", "vulhub_compose")
 _VULHUB_COMPOSE_REQUIRED_FIELDS = ("vulhub_case_path", "victim_service")
+
+
+# ---------------------------------------------------------------------------
+# version range matching — ใช้เช็คว่า target version (เช่น หลัง patch) ยังอยู่ใน
+# version_range ที่ cve_meta บอกว่ามี attack_strategy รองรับไหม (ดู
+# resolve_attack_strategy_for_version) เทียบแบบ tuple ตัวเลขง่ายๆ ไม่ใช่ semver
+# parser เต็มรูปแบบ ("ง่ายที่สุดก่อน" ตาม pattern เดียวกับ update._eval_applies_when)
+# ---------------------------------------------------------------------------
+
+_RANGE_OPS: dict[str, Callable[[tuple, tuple], bool]] = {
+    ">=": operator.ge, "<=": operator.le, ">": operator.gt, "<": operator.lt, "==": operator.eq,
+}
+_RANGE_CLAUSE_RE = re.compile(
+    r"^(" + "|".join(re.escape(op) for op in _RANGE_OPS) + r")\s*([\w.\-]+)$"
+)
+
+
+def _parse_version(version: str) -> tuple[int, ...]:
+    """'9.5.1' -> (9,5,1) / '1.4.2' -> (1,4,2) — ตัด suffix ที่ไม่ใช่ตัวเลขนำทิ้ง
+    (pre-release/build tag) ไม่รองรับ semver เต็มรูปแบบ พอสำหรับเทียบ major.minor.patch
+    """
+    parts = []
+    for chunk in version.split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _version_in_range(version: str, range_str: str) -> bool:
+    """range_str เช่น '>=1.3.0,<=1.4.2' หรือ '>=1.4.3' (comma = AND ของทุกเงื่อนไข)"""
+    v = _parse_version(version)
+    for clause in range_str.split(","):
+        clause = clause.strip()
+        match = _RANGE_CLAUSE_RE.match(clause)
+        if not match:
+            raise StopPipeline(
+                f"version_range clause รูปแบบไม่รองรับ: {clause!r} ใน {range_str!r} "
+                f"(รองรับแค่ {list(_RANGE_OPS)})",
+                status="STOPPED",
+                evidence={"range_str": range_str, "clause": clause},
+            )
+        op_str, bound_str = match.groups()
+        bound = _parse_version(bound_str)
+        width = max(len(v), len(bound))
+        v_padded = v + (0,) * (width - len(v))
+        bound_padded = bound + (0,) * (width - len(bound))
+        if not _RANGE_OPS[op_str](v_padded, bound_padded):
+            return False
+    return True
+
+
+def resolve_attack_strategy_for_version(cve_id: str, version: str) -> Optional[str]:
+    """หา attack_strategy ที่ใช้ได้จริงกับ version ที่ระบุ (ต่างจาก resolve_case_config
+    ที่เอา 'verified: true' ตัวแรกที่เจอโดยไม่สนใจ version — ตัวนี้เทียบ version_range
+    จริง) คืน None ถ้าไม่ match range ไหนเลย หรือ match range ที่ attack_strategy: null
+    (แปลว่า exploit path ที่มีไม่มีความหมายกับ version นี้แล้ว — ไม่ใช่ error)
+    """
+    meta_path = CVE_META_DIR / f"{cve_id}.yaml"
+    meta = load_yaml(meta_path)
+    for affected in meta.get("affected", []):
+        for vr in affected.get("version_ranges", []):
+            if _version_in_range(version, vr["range"]):
+                return vr.get("attack_strategy")
+    return None
 
 
 def _resolve_deployment_config(

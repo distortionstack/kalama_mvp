@@ -141,11 +141,17 @@ def cmd_full(args: argparse.Namespace) -> int:
 
         patch_result = stage_patch(case, OUTPUT_DIR)
 
+        scan_after_result = stage_scan(case.cve_id, patch_result["image_tag"], phase="after")
+        case.record("scan_after", scan_after_result)
+
         stage_victim_down(case)
         case.config["before_patch"]["image"] = patch_result["image_tag"]
         target_ip_after = stage_victim_up(case)
 
-        after_result = stage_exploit(case, target_ip_after, wait_for_target=True)
+        after_result = stage_exploit(
+            case, target_ip_after, wait_for_target=True,
+            target_version=patch_result["used_version"],
+        )
 
         exploited_before = before_result["oracle_result"] == "SUCCESS"
         exploited_after = after_result["oracle_result"] == "SUCCESS"
