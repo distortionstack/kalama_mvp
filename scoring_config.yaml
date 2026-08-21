@@ -1,0 +1,58 @@
+# scoring_config.yaml
+#
+# ไม่ผูกกับ CVE ไหนโดยเฉพาะ — ใช้ตอนประมวลผล Trivy scan output ทั้งชุด
+# เพื่อคำนวณ score และตัดสิน predicted_high ก่อนจะไป filter ด้วย adapter coverage
+
+predicted_high_threshold: 7   # score >= ค่านี้ → predicted_high = 1
+                                # เป็นเกณฑ์ "อันตรายจริง" ไม่เกี่ยวกับว่ามี adapter ยิงได้ไหม
+
+top_n: 30   # จำนวน CVE สูงสุดที่จะพิจารณายิงต่อรอบ scan (resource constraint,
+            # แยกจาก predicted_high_threshold เพราะเป็นคนละมิติกัน)
+
+scoring_formula:
+  base: cvss   # คะแนนตั้งต้นจาก Trivy (CVSS base score, 0-10)
+  epss_multiplier: true   # score *= (1 + epss)
+  kev_bonus: 2   # +2 ถ้า CVE อยู่ใน CISA KEV
+  reachable_bonus: 2   # +2 ถ้า reachability check ผ่าน (ยังไม่ implement — placeholder)
+  score_cap: 15
+
+data_sources:
+  epss:
+    endpoint: "https://api.first.org/data/v1/epss?cve={cve_id}"
+    field_path: "data[0].epss"
+    fallback_value: 0.0   # ถ้า query ไม่เจอ CVE ใน EPSS
+  kev:
+    endpoint: "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+    field_path: "vulnerabilities[].cveID"
+    cache_ttl_hours: 24   # ไม่ต้อง fetch ทุกครั้ง — เป็น static feed อัปเดตไม่บ่อย
+
+adapter_coverage_check:
+  # ทุก CVE ใน top N ต้องผ่านทั้งสองข้อนี้ถึงจะ "eligible_to_test"
+  requires:
+    - "cve_meta/{cve_id}.yaml exists"
+    - "attack strategy ที่ cve_meta ชี้ไป มี version range ครอบคลุม installed_version จริง"
+    - "patch/{dependency}/{fixed_version}.yaml exists สำหรับ fixed_version ที่ cve_meta ต้องการ"
+  on_missing: skip   # ไม่ error — แค่บันทึกว่า adapter_status = no_adapter
+
+results_output:
+  path: "output/results.csv"
+  columns:
+    - cve_id
+    - dependency
+    - version
+    - cvss
+    - epss
+    - in_kev
+    - reachable
+    - score
+    - predicted_high        # 0/1 จาก score >= predicted_high_threshold — ไม่เกี่ยวกับ adapter
+    - adapter_status         # available / no_adapter
+    - exploited               # 0/1 จาก oracle, null ถ้า adapter_status = no_adapter
+    - included_in_metrics     # true/false — false เสมอถ้า adapter_status = no_adapter
+
+metrics_calculation:
+  filter: "included_in_metrics == true"   # คำนวณ P/R/F1 เฉพาะแถวที่ยิงได้จริง
+  note: >
+    Sample สำหรับ P/R/F1 คือ "CVE ที่ adapter ครบและยิงได้จริง" ไม่ใช่ CVE ทั้งหมด
+    ที่ scanner เจอ หรือทั้งหมดที่เข้า top N — ต้องระบุเป็น limitation ในธีสิสชัดเจน
+    ว่า metric สะท้อนความแม่นยำของ scoring เฉพาะในขอบเขตที่เครื่องมือมี adapter รองรับ

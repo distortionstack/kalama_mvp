@@ -1,0 +1,85 @@
+# patch/org.elasticsearch:elasticsearch/1.4.3.yaml
+#
+# หน้าที่: เก็บข้อมูล "จะอัปเดต dependency นี้ไปเวอร์ชันนี้ยังไง" เท่านั้น
+# ไฟล์นี้ไม่รู้จัก CVE ใดๆ ทั้งสิ้น — updater code อ่านแค่ dependency+version
+# แล้วดึง fixed_version_strategy กับ upstream_fallback_strategy ไปใช้
+#
+# ทุก dependency module ต้องมีอย่างน้อย 2 strategy ข้างใน:
+#   1. fixed_version_strategy — ตรงจาก Trivy FixedVersion ตรงๆ ไม่ปรับแต่ง
+#   2. upstream_fallback_strategy — ใช้เมื่อ fixed_version_strategy ติดตั้งไม่ได้จริง
+#      (เช่น EOL mirror, artifact หาย) โค้ดเป็นคนตัดสินว่า "ติดตั้งไม่ได้จริง" คือเมื่อไหร่
+#      ไฟล์นี้แค่บอก "ถ้าต้อง fallback ให้ไปดึงจากไหน" ไม่ตัดสินใจแทนโค้ด
+
+dependency: org.elasticsearch:elasticsearch
+ecosystem: maven
+fixed_version: "1.4.3"   # ตรงจาก Trivy FixedVersion — ไม่ใช่เวอร์ชันที่เลือกใช้จริงเสมอไป
+
+fixed_version_strategy:
+  install_method: prebuilt_download
+  source_url_template: >-
+    https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-1.4.3-linux-x86_64.tar.gz
+  # หมายเหตุ: URL นี้อาจตายแล้วเพราะ 1.4.3 เก่ามาก — โค้ดต้อง HEAD request เช็คก่อน
+  # ถ้า 404/ไม่ reachable ให้ตีความว่า "ติดตั้งไม่ได้จริง" แล้ว fallback ไป
+  # upstream_fallback_strategy ด้านล่าง (ไม่ใช่แค่เพราะ "ดูเก่า")
+  known_issue: >
+    download.elastic.co (URL รุ่นเก่าที่ vulhub Dockerfile บางตัวยังอ้างอิงอยู่)
+    deprecated แล้ว ต้องใช้ artifacts.elastic.co เท่านั้น
+
+upstream_fallback_strategy:
+  # ใช้เมื่อ fixed_version_strategy ติดตั้งไม่ได้จริง (โค้ดตัดสิน ไม่ใช่ config นี้)
+  install_method: prebuilt_download
+  registry: elastic_artifacts
+  source_url_template: >-
+    https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-${LATEST_VERSION}-linux-x86_64.tar.gz
+  latest_version_lookup:
+    method: http_get_json
+    url: https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch.json   # ****ยืนยัน endpoint จริงที่ใช้เช็ค latest version — ตอน lab note ใช้เลขที่รู้อยู่แล้ว (9.5.1) ไม่ได้ query endpoint นี้จริง****
+    version_field: "latest"   # ****ต้องยืนยัน field name จริงจาก response****
+  known_config_overrides_required:
+    # ถ้า fallback ไป major version ใหม่มาก (เช่น 9.x) มักต้องมี override เหล่านี้
+    # เก็บไว้เป็น reference ให้โค้ดดึงไปใช้ ไม่ต้อง hardcode ใน patch logic
+    - key: network.host
+      value: "0.0.0.0"
+      applies_when: "major_version >= 8"
+      reason: "ES 8.x+ bind 127.0.0.1 by default"
+    - key: xpack.security.enabled
+      value: false
+      applies_when: "major_version >= 8"
+      reason: "TLS/auth enabled by default ตั้งแต่ ES 8.x — lab-only override"
+    - key: discovery.type
+      value: single-node
+      applies_when: "major_version >= 5"
+    - key: cluster.routing.allocation.disk.threshold_enabled
+      value: false
+      applies_when: always
+      reason: "lab environment disk free ต่ำ trigger watermark บ่อย"
+
+build:
+  base_image: debian:bookworm-slim
+  install_path: /usr/share/elasticsearch
+  # post_build (rebuild_docker_image/rename_container/attach_network) เอาออกแล้ว —
+  # เช็คแล้วไม่มีจุดไหนในโค้ดอ่าน field พวกนี้เลย (rename เป็น victim + attach
+  # kalama-net ทำจริงใน exploit.py _victim_up_single_image ตรงๆ อยู่แล้ว)
+  add_install_bin_to_path: true   # ENV PATH=<install_path>/bin:$PATH — ตัว `elasticsearch`
+                                   # executable อยู่ใต้ bin/ ต้องมีใน PATH ให้ ENTRYPOINT เรียกเจอ
+  config_file_relpath: "config/elasticsearch.yml"   # known_config_overrides_required ด้านล่าง
+                                                      # ต้องถูกเขียนทับไฟล์นี้จริง (>>) ไม่ใช่แค่ echo ทิ้ง
+  runtime_user:
+    name: elasticsearch
+    uid: 1000
+    gid: 1000
+    reason: >
+      ES ไม่ควรรันเป็น root — ตาม Dockerfile ที่เคยรันผ่านจริงใน
+      lab-note-CVE-2015-1427.md §4 (groupadd/useradd + chown + USER ก่อน ENTRYPOINT)
+  entrypoint: ["elasticsearch"]   # ไม่มีตัวนี้ container จะได้ CMD จาก base image
+                                   # (bash) แล้วจบทันทีโดยไม่รัน ES เลย — ยืนยันจาก run จริงที่พัง
+  scan_timeout_override: "15m"   # Trivy timeout บน single-layer tarball ใหญ่
+
+verified_case:
+  # cross-reference — ยืนยันว่า strategy นี้เคยรันผ่านจริงกับ CVE ไหน เพื่อ traceability
+  # (ไฟล์นี้เองไม่ผูกกับ CVE แต่เก็บ pointer ไว้ตรวจสอบย้อนหลังได้)
+  - cve_id: CVE-2015-1427
+    fallback_used: true   # ใช้จริงคือ upstream_fallback_strategy ไป 9.5.1 ไม่ใช่ 1.4.3 ตรงๆ
+    actual_version_installed: "9.5.1"
+    lab_note_date: "2026-08-18"
+    jump_classification: feature_removal_jump   # Groovy→Painless — ไม่ใช่แค่ config-default jump
