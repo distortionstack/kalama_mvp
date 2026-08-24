@@ -17,7 +17,14 @@ Usage:
         dependency+fixed_version จาก config เดียวกัน)
 
     python3 main.py full --cve CVE-2015-1427 --image vulhub/elasticsearch:1.4.2 --port 9200
-        รันครบ: exploit(before) -> patch -> exploit(after) -> บันทึกลง results.csv
+        รันครบ 1 CVE เดี่ยว: exploit(before) -> patch -> exploit(after) -> บันทึกลง results.csv
+        (สำหรับ debug/manual override CVE เดียว — ไม่ต้องระบุ --cve ถ้าจะยิงหลายตัว
+        พร้อมกัน ดู run-eligible ด้านล่าง)
+
+    python3 main.py run-eligible --image vulhub/elasticsearch:1.4.2 --port 9200
+        list (scan+score+adapter check) -> full loop ให้ทุก CVE ที่ adapter_status ==
+        "available" ทีละตัว (ไม่ยิงพร้อมกัน กัน port/container ชื่อ victim ชนกัน)
+        ตัวไหน SKIPPED/STOPPED ไป log แล้วไปต่อตัวถัดไป ไม่ทำ batch หยุดทั้งชุด
 
     python3 main.py report --csv output/results.csv
         คำนวณ P/R/F1 จาก results.csv ที่มีอยู่ (filter included_in_metrics)
@@ -123,72 +130,133 @@ def cmd_patch(args: argparse.Namespace) -> int:
         return 0 if e.status == "SKIPPED" else 1
 
 
-def cmd_full(args: argparse.Namespace) -> int:
+def _run_full_loop(cve_id: str, image: str, port: int | None) -> dict:
     """exploit(before) -> patch -> exploit(after, ใช้ image ที่ patch แล้ว) -> results.csv
 
-    บันทึกผลลง results.csv 1 แถวสำหรับ CVE นี้ (predicted_high มาจาก scoring ถ้ามี
-    ไฟล์ results.csv อยู่แล้วจาก `list`, ไม่งั้น default 1 เพราะ manual-run เจาะจง
-    CVE นี้แปลว่าถือว่าน่าสนใจอยู่แล้ว)
+    entrypoint จริงของ full loop 1 CVE — แยกออกมาจาก cmd_full เดิมเพื่อให้
+    cmd_full (single-CVE CLI) และ cmd_run_eligible (multi-CVE loop) เรียกใช้
+    logic เดียวกันได้ ไม่ duplicate — StopPipeline ปล่อยให้ propagate ออกไปเสมอ
+    ให้ caller เป็นคนจัดการ (cmd_full catch เพื่อแปลงเป็น exit code,
+    cmd_run_eligible catch ต่อ CVE ในลูปเพื่อไปต่อตัวถัดไปโดยไม่ทำทั้ง batch พัง)
+
+    บันทึกผลลง results.csv 1 แถวสำหรับ CVE นี้ (ต้องรัน `list` มาก่อนให้มี row
+    อยู่แล้ว ไม่ re-score ใหม่ตรงนี้)
     """
-    print(f"=== FULL LOOP: {args.cve} ===")
-    try:
-        # scan ต้องมาก่อน load_case เสมอ (evidence-first) — ไม่โหลด/resolve
-        # exploit config (cve_meta+attack+patch 3 ไฟล์) จนกว่าจะยืนยันว่า scanner
-        # เจอ CVE นี้ในอิมเมจเป้าหมายจริง ไม่ใช่พึ่ง StopPipeline(SKIPPED) ตัด flow เฉยๆ
-        stage_scan(args.cve, args.image, phase="before")
+    print(f"=== FULL LOOP: {cve_id} ===")
 
-        case = _load_case(args.cve, args.image, args.port)
+    # scan ต้องมาก่อน load_case เสมอ (evidence-first) — ไม่โหลด/resolve
+    # exploit config (cve_meta+attack+patch 3 ไฟล์) จนกว่าจะยืนยันว่า scanner
+    # เจอ CVE นี้ในอิมเมจเป้าหมายจริง ไม่ใช่พึ่ง StopPipeline(SKIPPED) ตัด flow เฉยๆ
+    stage_scan(cve_id, image, phase="before")
 
-        target_ip = stage_victim_up(case)
-        case.record("victim_up", {"target_ip": target_ip})
+    case = _load_case(cve_id, image, port)
 
-        before_result = stage_exploit(case, target_ip)
-        if before_result["oracle_result"] != "SUCCESS":
-            raise StopPipeline("EXPLOIT (before) ไม่ SUCCESS — หยุด full loop", status="STOPPED", evidence=before_result)
+    target_ip = stage_victim_up(case)
+    case.record("victim_up", {"target_ip": target_ip})
 
-        patch_result = stage_patch(case, OUTPUT_DIR)
+    before_result = stage_exploit(case, target_ip)
+    if before_result["oracle_result"] != "SUCCESS":
+        raise StopPipeline("EXPLOIT (before) ไม่ SUCCESS — หยุด full loop", status="STOPPED", evidence=before_result)
 
-        scan_after_result = stage_scan(case.cve_id, patch_result["image_tag"], phase="after")
-        case.record("scan_after", scan_after_result)
+    patch_result = stage_patch(case, OUTPUT_DIR)
 
-        stage_victim_down(case)
-        case.config["before_patch"]["image"] = patch_result["image_tag"]
-        target_ip_after = stage_victim_up(case)
+    scan_after_result = stage_scan(case.cve_id, patch_result["image_tag"], phase="after")
+    case.record("scan_after", scan_after_result)
 
-        after_result = stage_exploit(
-            case, target_ip_after, wait_for_target=True,
-            target_version=patch_result["used_version"],
-        )
+    stage_victim_down(case)
+    case.config["before_patch"]["image"] = patch_result["image_tag"]
+    target_ip_after = stage_victim_up(case)
 
-        exploited_before = before_result["oracle_result"] == "SUCCESS"
-        exploited_after = after_result["oracle_result"] == "SUCCESS"
+    after_result = stage_exploit(
+        case, target_ip_after, wait_for_target=True,
+        target_version=patch_result["used_version"],
+    )
 
-        print(f"\n[DONE] full loop: before={exploited_before} after={exploited_after}")
-        case.record("full_loop_complete", {
-            "exploited_before": exploited_before,
-            "exploited_after": exploited_after,
-            "patch_strategy_used": patch_result["used_strategy"],
-        })
+    exploited_before = before_result["oracle_result"] == "SUCCESS"
+    exploited_after = after_result["oracle_result"] == "SUCCESS"
 
-        # --- เขียนผล exploited (before) กลับเข้า results.csv (ต้องมี row ของ CVE นี้
-        # อยู่แล้วจาก `main.py list` มาก่อน — ไม่ re-score ใหม่ตรงนี้) ---
-        csv_path = OUTPUT_DIR / "results.csv"
-        if not csv_path.exists():
-            print(f"  [WARN] {csv_path} ไม่พบ — รัน `main.py list --image <image>` ก่อนถ้าต้องการให้ผลนี้ไปรวม P/R/F1 ได้")
+    print(f"\n[DONE] full loop: before={exploited_before} after={exploited_after}")
+    case.record("full_loop_complete", {
+        "exploited_before": exploited_before,
+        "exploited_after": exploited_after,
+        "patch_strategy_used": patch_result["used_strategy"],
+    })
+
+    # --- เขียนผล exploited (before) กลับเข้า results.csv (ต้องมี row ของ CVE นี้
+    # อยู่แล้วจาก `main.py list` มาก่อน — ไม่ re-score ใหม่ตรงนี้) ---
+    csv_path = OUTPUT_DIR / "results.csv"
+    if not csv_path.exists():
+        print(f"  [WARN] {csv_path} ไม่พบ — รัน `main.py list --image <image>` ก่อนถ้าต้องการให้ผลนี้ไปรวม P/R/F1 ได้")
+    else:
+        scored = load_scored_cves_from_csv(csv_path)
+        if not any(c.cve_id == case.cve_id for c in scored):
+            print(f"  [WARN] {case.cve_id} ไม่มีอยู่ใน {csv_path} — รัน `main.py list --image <image>` ก่อนถ้าต้องการให้ผลนี้ไปรวม P/R/F1 ได้")
         else:
-            scored = load_scored_cves_from_csv(csv_path)
-            if not any(c.cve_id == case.cve_id for c in scored):
-                print(f"  [WARN] {case.cve_id} ไม่มีอยู่ใน {csv_path} — รัน `main.py list --image <image>` ก่อนถ้าต้องการให้ผลนี้ไปรวม P/R/F1 ได้")
-            else:
-                update_exploit_result(scored, case.cve_id, exploited_before, before_result["oracle_status"])
-                write_results_csv(scored, csv_path)
-                print(f"  [OK] อัปเดต {case.cve_id} เข้า {csv_path} — exploited={exploited_before} oracle_status={before_result['oracle_status']}")
+            update_exploit_result(scored, case.cve_id, exploited_before, before_result["oracle_status"])
+            write_results_csv(scored, csv_path)
+            print(f"  [OK] อัปเดต {case.cve_id} เข้า {csv_path} — exploited={exploited_before} oracle_status={before_result['oracle_status']}")
 
+    return {
+        "exploited_before": exploited_before,
+        "exploited_after": exploited_after,
+        "patch_strategy_used": patch_result["used_strategy"],
+    }
+
+
+def cmd_full(args: argparse.Namespace) -> int:
+    """CLI เดี่ยว — 1 CVE ที่ระบุตรงผ่าน --cve (ใช้สำหรับ debug/manual override)"""
+    try:
+        _run_full_loop(args.cve, args.image, args.port)
         return 0
-
     except StopPipeline as e:
         print(f"\n[{e.status}] {e.reason}")
         return 0 if e.status == "SKIPPED" else 1
+
+
+def cmd_run_eligible(args: argparse.Namespace) -> int:
+    """list (scan+score+adapter check) -> full loop ทีละ CVE สำหรับทุกตัวที่
+    adapter_status == "available" — ไม่ยิงพร้อมกัน (กัน port/container ชื่อ
+    'victim' ชนกัน) แต่ละ CVE fail แล้วต้องไม่ทำทั้ง batch หยุด — log แล้วไปต่อ
+    ตัวถัดไปเสมอ ไม่ว่าจะ StopPipeline (SKIPPED/STOPPED) หรือ exception อื่นที่
+    ไม่คาดคิด (กัน batch รันข้ามคืนแล้วตายเพราะ CVE ตัวเดียวพังกลางทาง)
+    """
+    print(f"=== RUN-ELIGIBLE: full loop ทุก CVE ที่ adapter พร้อม (image={args.image}) ===")
+    scan_json_path = OUTPUT_DIR / "_scoring_scans" / f"{args.image.replace('/', '_').replace(':', '_')}.json"
+    stage_trivy_full_scan(args.image, scan_json_path)
+
+    scored = score_and_filter(scan_json_path)
+    eligible = eligible_cases(scored)
+
+    csv_path = OUTPUT_DIR / "results.csv"
+    write_results_csv(scored, csv_path)
+
+    print(f"\n{len(eligible)} / {len(scored)} CVE พร้อมยิงจริง (adapter ครบ) — จะรัน full loop ทีละตัว")
+
+    success: list[str] = []
+    skipped: list[str] = []
+    stopped: list[str] = []
+
+    for cve in eligible:
+        print(f"\n{'=' * 70}\n>>> {cve.cve_id}\n{'=' * 70}")
+        try:
+            _run_full_loop(cve.cve_id, args.image, args.port)
+            success.append(cve.cve_id)
+        except StopPipeline as e:
+            print(f"[{e.status}] {e.reason}")
+            (skipped if e.status == "SKIPPED" else stopped).append(cve.cve_id)
+        except Exception as e:  # noqa: BLE001 — เจตนา: CVE เดียวพังไม่ควรทำทั้ง batch หยุด
+            print(f"[ERROR] {cve.cve_id}: exception ที่ไม่คาดคิด: {e}")
+            stopped.append(cve.cve_id)
+
+    print(f"\n{'=' * 70}")
+    print(" RUN-ELIGIBLE SUMMARY")
+    print(f"{'=' * 70}")
+    print(f"  ผ่านจริง (SUCCESS): {len(success)} — {success}")
+    print(f"  SKIPPED:            {len(skipped)} — {skipped}")
+    print(f"  STOPPED/ERROR:      {len(stopped)} — {stopped}")
+    print(f"{'=' * 70}")
+
+    return 0
 
 
 def cmd_report(args: argparse.Namespace) -> int:
@@ -226,11 +294,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_patch.add_argument("--port", type=int, default=None)
     p_patch.set_defaults(func=cmd_patch)
 
-    p_full = sub.add_parser("full", help="exploit(before) -> patch -> exploit(after)")
+    p_full = sub.add_parser("full", help="exploit(before) -> patch -> exploit(after) — CVE เดียว (debug/override)")
     p_full.add_argument("--cve", required=True)
     p_full.add_argument("--image", required=True)
     p_full.add_argument("--port", type=int, default=None)
     p_full.set_defaults(func=cmd_full)
+
+    p_run_eligible = sub.add_parser(
+        "run-eligible", help="list -> full loop ทีละตัวให้ทุก CVE ที่ adapter พร้อม (ไม่ต้องระบุ --cve)"
+    )
+    p_run_eligible.add_argument("--image", required=True)
+    p_run_eligible.add_argument("--port", type=int, default=None)
+    p_run_eligible.set_defaults(func=cmd_run_eligible)
+
     p_report = sub.add_parser("report", help="คำนวณ P/R/F1 จาก results.csv")
     p_report.add_argument("--csv", default=str(PROJECT_ROOT / "output" / "results.csv"))
     p_report.set_defaults(func=cmd_report)
