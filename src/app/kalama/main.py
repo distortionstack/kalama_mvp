@@ -37,7 +37,7 @@ from .core import CaseState, StopPipeline, PROJECT_ROOT, OUTPUT_DIR
 from .scan import resolve_case_config, stage_scan, stage_trivy_full_scan
 from .exploit import stage_victim_up, stage_victim_down, stage_exploit
 from .update import stage_patch
-from .list import score_and_filter, eligible_cases
+from .list import score_and_filter, eligible_cases, load_scored_cves_from_csv
 from .summary import write_results_csv, update_exploit_result, compute_metrics, print_report
 
 
@@ -162,6 +162,21 @@ def cmd_full(args: argparse.Namespace) -> int:
             "exploited_after": exploited_after,
             "patch_strategy_used": patch_result["used_strategy"],
         })
+
+        # --- เขียนผล exploited (before) กลับเข้า results.csv (ต้องมี row ของ CVE นี้
+        # อยู่แล้วจาก `main.py list` มาก่อน — ไม่ re-score ใหม่ตรงนี้) ---
+        csv_path = OUTPUT_DIR / "results.csv"
+        if not csv_path.exists():
+            print(f"  [WARN] {csv_path} ไม่พบ — รัน `main.py list --image <image>` ก่อนถ้าต้องการให้ผลนี้ไปรวม P/R/F1 ได้")
+        else:
+            scored = load_scored_cves_from_csv(csv_path)
+            if not any(c.cve_id == case.cve_id for c in scored):
+                print(f"  [WARN] {case.cve_id} ไม่มีอยู่ใน {csv_path} — รัน `main.py list --image <image>` ก่อนถ้าต้องการให้ผลนี้ไปรวม P/R/F1 ได้")
+            else:
+                update_exploit_result(scored, case.cve_id, exploited_before, before_result["oracle_status"])
+                write_results_csv(scored, csv_path)
+                print(f"  [OK] อัปเดต {case.cve_id} เข้า {csv_path} — exploited={exploited_before} oracle_status={before_result['oracle_status']}")
+
         return 0
 
     except StopPipeline as e:

@@ -17,6 +17,7 @@ config: scoring_config.yaml (root ของโปรเจกต์) — ห้�
 
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +47,13 @@ class ScoredCVE:
     fixed_version_config: Optional[str] = None  # version ที่ patch/ module มีจริง (อาจไม่ตรง fixed_version เป๊ะ)
 
     def to_row(self) -> dict[str, Any]:
-        """แปลงเป็น dict ตรงกับ columns ใน scoring_config.results_output.columns"""
+        """แปลงเป็น dict ตรงกับ columns ใน scoring_config.results_output.columns
+
+        exploited/included_in_metrics อ่านจาก __dict__["_exploited"]/
+        ["_included_in_metrics"] ที่ update_exploit_result() เขียนไว้ (workaround
+        แทน field จริงใน dataclass — ดู AGENT_README ข้อ 8) ถ้ายังไม่เคยเรียก
+        update_exploit_result() เลย ใช้ default None/False เหมือนเดิม
+        """
         return {
             "cve_id": self.cve_id,
             "dependency": self.dependency,
@@ -58,14 +65,42 @@ class ScoredCVE:
             "score": self.score,
             "predicted_high": self.predicted_high,
             "adapter_status": self.adapter_status,
-            # exploited / included_in_metrics เติมทีหลังโดย exploit.py + summary.py
-            "exploited": None,
-            "included_in_metrics": False,
+            "exploited": self.__dict__.get("_exploited"),
+            "included_in_metrics": self.__dict__.get("_included_in_metrics", False),
         }
 
 
 def load_scoring_config() -> dict[str, Any]:
     return load_yaml(SCORING_CONFIG_PATH)
+
+
+def load_scored_cves_from_csv(csv_path: Path) -> list[ScoredCVE]:
+    """โหลด results.csv (ที่เขียนไว้แล้วจาก `list`) กลับเป็น ScoredCVE list — ใช้ตอน
+    `full` ต้องการอัปเดต row ของ CVE ที่เพิ่งยิงจริงเข้า CSV เดิม โดยไม่ต้อง
+    re-score/re-scan ใหม่ทั้งก้อน
+
+    fixed_version ไม่ได้เก็บใน CSV เลย (ไม่จำเป็นอีกหลัง adapter_status ถูก
+    กำหนดแล้วตอน `list` — ใช้แค่ตอน check_adapter_coverage() เท่านั้น) จึงเป็น
+    None เสมอตอนโหลดกลับ ใช้ต่อได้แค่ update_exploit_result/write_results_csv
+    ไม่ใช่ re-run check_adapter_coverage
+    """
+    out = []
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            out.append(ScoredCVE(
+                cve_id=row["cve_id"],
+                dependency=row["dependency"],
+                installed_version=row["version"],
+                fixed_version=None,
+                cvss=float(row["cvss"]),
+                epss=float(row["epss"]),
+                in_kev=row["in_kev"].strip().lower() == "true",
+                reachable=row["reachable"].strip().lower() == "true",
+                score=float(row["score"]),
+                predicted_high=int(row["predicted_high"]),
+                adapter_status=row["adapter_status"],
+            ))
+    return out
 
 
 def fetch_epss(cve_id: str, config: dict[str, Any]) -> float:
@@ -182,9 +217,12 @@ def check_adapter_coverage(cve: ScoredCVE) -> ScoredCVE:
     # patch module: dependency name ใน path ใช้ "--" แทน ":" (Maven groupId:artifactId
     # มี ":" ซึ่งใช้เป็นชื่อโฟลเดอร์ไม่ได้ตรงๆ บน filesystem บางตัว) — ต้อง sanitize เหมือนกันทุกที่
     dep_dir_name = cve.dependency.replace(":", "--")
-    fixed_version = meta.get("fixed_by_dependency_patch") and cve.fixed_version_config
-    # fixed_version_config อาจยังไม่ถูกกำหนด ณ จุดนี้ — ลอง fixed_version จาก Trivy ตรงๆ ก่อน
-    candidates_to_try = [cve.fixed_version] if cve.fixed_version else []
+    # Trivy อาจคืนหลาย FixedVersion คั่นด้วย comma (คนละ branch กัน เช่น
+    # "1.3.8, 1.4.3") — ต้องลองทุกตัวตามลำดับที่ Trivy คืนมา ไม่ใช่แค่ตัวแรกเสมอ
+    # เพราะ patch adapter อาจมีแค่บาง version เท่านั้น ไม่ใช่ทุกตัว (เจอจริงกับ
+    # CVE-2015-1427: Trivy คืน "1.3.8, 1.4.3" แต่ patch/ มีแค่ 1.4.3.yaml —
+    # เดิม hardcode เอาตัวแรกเสมอเลยหา 1.3.8.yaml ที่ไม่มีจริง แล้วรายงาน no_adapter ผิด)
+    candidates_to_try = [v.strip() for v in (cve.fixed_version or "").split(",") if v.strip()]
     patch_file = None
     for v in candidates_to_try:
         p = PATCH_DIR / dep_dir_name / f"{v}.yaml"
@@ -231,7 +269,9 @@ def score_and_filter(
             cve_id=cve_id,
             dependency=v["dependency"],
             installed_version=v["installed_version"],
-            fixed_version=(v["fixed_version"] or "").split(",")[0].strip() or None,
+            # เก็บ raw string ทุกตัวไว้ (ไม่ตัดเอาแค่ตัวแรก) — check_adapter_coverage()
+            # เป็นคนแยก comma แล้วลองทุก candidate เอง (ดู comment ที่นั่น)
+            fixed_version=(v["fixed_version"] or "").strip() or None,
             cvss=v["cvss"],
             epss=epss,
             in_kev=in_kev,
