@@ -12,6 +12,7 @@ core.py — สิ่งที่ทุก module ใน kalama ใช้ร่�
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -35,6 +36,21 @@ PATCH_DIR = PROJECT_ROOT / "patch"
 WORKBENCH_CONTAINER = "kalama-workbench"
 VICTIM_CONTAINER = "victim"
 KALAMA_NETWORK = "kalama-net"
+
+# vulhub repo root — mount ที่ 2 ใน setup-workbench.sh (แยกจาก /workspace เดิมที่
+# scan/patch ใช้อยู่ ห้ามยุ่งกัน) mount ด้วย "host path เดียวกันทั้งสองฝั่ง"
+# (source == destination) เพื่อให้ `docker compose` ที่รันข้างใน kalama-workbench
+# resolve relative volume mount (เช่น "./victim.cgi:...") ตรงกับ path จริงบน host
+# — ไม่งั้น host docker daemon (ผ่าน docker.sock sibling) จะ auto-create
+# ไดเรกทอรีว่างแทนไฟล์จริง (bug ที่เจอจริงตอนทดสอบ CVE-2014-6271)
+# ต้องตรงกับ "$LAB_DIR/vulhub" ใน setup-workbench.sh เป๊ะ — ถ้าเปลี่ยน LAB_DIR
+# ตอนรัน setup-workbench.sh ต้องตั้ง KALAMA_VULHUB_ROOT ให้ตรงกันด้วย
+VULHUB_HOST_ROOT = Path(
+    os.environ.get(
+        "KALAMA_VULHUB_ROOT",
+        str(Path.home() / "kalama-labs-area" / "kalama-recovered" / "vulhub"),
+    )
+)
 
 
 class StopPipeline(Exception):

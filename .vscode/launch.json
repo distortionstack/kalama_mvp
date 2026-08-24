@@ -1,0 +1,57 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "kalama: full (CVE-2015-1427)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "kalama.main",
+            "args": ["full", "--cve", "CVE-2015-1427", "--image", "vulhub/elasticsearch:1.4.2", "--port", "9200"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src/app"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "kalama: exploit (CVE-2015-1427)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "kalama.main",
+            "args": ["exploit", "--cve", "CVE-2015-1427", "--image", "vulhub/elasticsearch:1.4.2", "--port", "9200"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src/app"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "kalama: list (elasticsearch 1.4.2)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "kalama.main",
+            "args": ["list", "--image", "vulhub/elasticsearch:1.4.2"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src/app"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "kalama: report",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "kalama.main",
+            "args": ["report"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src/app"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

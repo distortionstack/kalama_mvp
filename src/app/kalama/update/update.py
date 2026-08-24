@@ -151,15 +151,45 @@ def _resolve_latest_upstream_version(strategy_cfg: dict[str, Any]) -> Optional[s
         return None
 
 
+def _patch_via_copacetic(case: CaseState, patch_cfg: dict[str, Any]) -> dict[str, Any]:
+    """fix_type C (os-package) — dispatch branch เตรียมไว้สำหรับ Copacetic (`copa patch`)
+
+    ต่างจาก fix_type A/B ที่ผูกกับ fixed_version_strategy/upstream_fallback_strategy
+    ต่อ dependency เดี่ยวๆ (ผ่าน _try_strategy) — Copacetic กิน Trivy scan report
+    ของทั้ง image ตรงๆ (`trivy image` -> `copa patch`) ไม่ต้องมี per-dependency
+    adapter แบบ A/B เลย
+
+    STUB เท่านั้นตอนนี้ — เตรียม dispatch branch ให้พร้อมรับตาม fix_type C
+    dossier ยังไม่ implement การเรียก `copa` จริง (รอ integration รอบถัดไป)
+    ไม่แตะ _try_strategy/_install_prebuilt_download/_resolve_latest_upstream_version เดิมเลย
+    """
+    case.record("patch", {
+        "success": False,
+        "reason": "fix_type_c_not_implemented",
+        "fix_type": "C",
+        "patch_mechanism": patch_cfg.get("fix_mechanism", "copacetic"),
+    })
+    raise StopPipeline(
+        f"{case.cve_id}: fix_type C (Copacetic) ยังไม่ implement จริง — dispatch branch "
+        f"เตรียมไว้แล้ว รอต่อ `copa patch` ในรอบถัดไป",
+        status="STOPPED",
+        evidence={"fix_type": "C", "dependency": patch_cfg.get("dependency")},
+    )
+
+
 def stage_patch(case: CaseState, workdir_root: Path) -> dict[str, Any]:
     """entrypoint หลัก — เรียกจาก main.py subcommand 'patch'
 
-    ลำดับ:
+    ลำดับ (fix_type A/B — dependency-centric ผ่าน _try_strategy):
         1. ลอง fixed_version_strategy ด้วย fixed_version จาก config
         2. ถ้า fail (ติดตั้งไม่ได้จริง) → ลอง upstream_fallback_strategy
            โดย resolve latest version ก่อน (หรือใช้ verified_case ที่เคยบันทึกไว้
            ถ้ามี — ดู note ด้านล่าง)
         3. build image, rebuild victim container (patch-as-rebuild policy)
+
+    fix_type C (os-package, เช่น bash/openssl ผ่าน apt) dispatch ไป
+    _patch_via_copacetic() ตรงๆ ก่อนถึง logic ข้างบนเลย — ไม่ผ่าน
+    fixed_version_strategy/_try_strategy เพราะ Copacetic ทำงานคนละแบบ
     """
     patch_cfg = case.config.get("patch")
     if patch_cfg is None:
@@ -169,6 +199,9 @@ def stage_patch(case: CaseState, workdir_root: Path) -> dict[str, Any]:
             status="SKIPPED",
             evidence={},
         )
+
+    if patch_cfg.get("fix_type") == "C":
+        return _patch_via_copacetic(case, patch_cfg)
 
     dependency = patch_cfg["dependency"]
     fixed_version = patch_cfg["fixed_version"]

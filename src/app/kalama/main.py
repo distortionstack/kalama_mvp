@@ -81,9 +81,12 @@ def _load_case(cve_id: str, image: str, port: int) -> CaseState:
 def cmd_exploit(args: argparse.Namespace) -> int:
     print(f"=== EXPLOIT: {args.cve} ===")
     try:
-        case = _load_case(args.cve, args.image, args.port)
+        # scan ต้องมาก่อน load_case เสมอ (evidence-first) — ไม่โหลด/resolve
+        # exploit config (cve_meta+attack+patch 3 ไฟล์) จนกว่าจะยืนยันว่า scanner
+        # เจอ CVE นี้ในอิมเมจเป้าหมายจริง ไม่ใช่พึ่ง StopPipeline(SKIPPED) ตัด flow เฉยๆ
+        stage_scan(args.cve, args.image, phase="before")
 
-        stage_scan(case.cve_id, args.image, phase="before")
+        case = _load_case(args.cve, args.image, args.port)
 
         target_ip = stage_victim_up(case)
         case.record("victim_up", {"target_ip": target_ip})
@@ -129,9 +132,13 @@ def cmd_full(args: argparse.Namespace) -> int:
     """
     print(f"=== FULL LOOP: {args.cve} ===")
     try:
+        # scan ต้องมาก่อน load_case เสมอ (evidence-first) — ไม่โหลด/resolve
+        # exploit config (cve_meta+attack+patch 3 ไฟล์) จนกว่าจะยืนยันว่า scanner
+        # เจอ CVE นี้ในอิมเมจเป้าหมายจริง ไม่ใช่พึ่ง StopPipeline(SKIPPED) ตัด flow เฉยๆ
+        stage_scan(args.cve, args.image, phase="before")
+
         case = _load_case(args.cve, args.image, args.port)
 
-        stage_scan(case.cve_id, args.image, phase="before")
         target_ip = stage_victim_up(case)
         case.record("victim_up", {"target_ip": target_ip})
 
@@ -224,7 +231,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_full.add_argument("--image", required=True)
     p_full.add_argument("--port", type=int, default=None)
     p_full.set_defaults(func=cmd_full)
-
     p_report = sub.add_parser("report", help="คำนวณ P/R/F1 จาก results.csv")
     p_report.add_argument("--csv", default=str(PROJECT_ROOT / "output" / "results.csv"))
     p_report.set_defaults(func=cmd_report)

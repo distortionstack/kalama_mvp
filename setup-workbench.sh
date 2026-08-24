@@ -38,11 +38,19 @@ echo "==> ลบ workbench container เก่า (ถ้ามี) — ตั�
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
 echo "==> สร้าง workbench container ใหม่"
+# mount ที่ 2 เฉพาะสำหรับ docker compose (vulhub case ที่มี relative volume mount
+# เช่น "./victim.cgi:...") — ต้อง mount ด้วย host path เดียวกันทั้งสองฝั่ง (source ==
+# destination) ไม่งั้น docker compose ที่รันข้างใน container นี้จะ resolve relative
+# path ผิด (เทียบกับ /workspace ข้างในตัวเอง ไม่ใช่ host จริง) แล้ว host docker
+# daemon (ผ่าน docker.sock) จะ auto-create ไดเรกทอรีว่างแทนไฟล์จริง — ไม่แตะ
+# "$LAB_DIR":/workspace เดิมที่ scan/patch stage ใช้อยู่แล้ว (docker exec + docker cp
+# ไม่มีปัญหานี้ ไม่ต้องแก้) ดู core.py VULHUB_HOST_ROOT ที่ต้องตรงกับ path นี้เป๊ะ
 docker run -d \
   --name "$CONTAINER_NAME" \
   --network "$NETWORK_NAME" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$LAB_DIR":/workspace \
+  -v "$LAB_DIR/vulhub":"$LAB_DIR/vulhub" \
   -v "$VOLUME_M2":/root/.m2 \
   -w /workspace \
   --restart unless-stopped \
