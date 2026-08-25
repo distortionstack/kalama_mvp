@@ -101,3 +101,26 @@ export PYTHONPATH=src/app
 python3 -m kalama.main exploit --cve CVE-2015-1427 --image vulhub/elasticsearch:1.4.2 --port 9200
 ```
 ต้องมี kalama-workbench + kalama-net ตั้งไว้แล้ว (setup-workbench.sh)
+
+## Regression ที่เจอและแก้แล้ว — check-gate ต้องเป็น opt-in ต่อ CVE (2026-08-24)
+
+ตอนเพิ่ม dual-signal oracle (check() ก่อน แล้วลอง `exploit -z` เฉพาะถ้า check
+ผ่าน) ให้ CVE-2015-1427 — `_exploit_msf()` เขียนให้ check-gate ทำงานกับ**ทุก**
+CVE ที่ `tool: msf` โดยไม่แยกว่า CVE นั้นตั้ง `oracle.verdict_source: msf_check`
+ไว้จริงไหม ผลคือ CVE-2017-5638 (legacy oracle, marker_path, ไม่มี
+`check_success_pattern`) โดน skip การยิง exploit จริงไปเลย ทั้งที่ MSF `check()`
+ตอบว่า vulnerable จริง (`check_passed` ถูก hardcode เป็น `False` เพราะไม่มี
+pattern ให้ match)
+
+**แก้แล้ว:** check-gate ทำงานเฉพาะเมื่อ `oracle.verdict_source == "msf_check"`
+เท่านั้น ([exploit.py](src/app/kalama/exploit/exploit.py) `_exploit_msf`) ถ้าไม่ได้
+ตั้งไว้ ยิง `exploit -z` ตรงๆ เหมือนพฤติกรรมเดิมก่อนมี dual-signal — regression
+test แล้วทั้งสองฝั่ง: CVE-2015-1427 (check-gate ใช้จริง) ยัง SUCCESS เหมือนเดิม,
+CVE-2017-5638 (ไม่มี check-gate) ยิงผ่าน `/tmp/success` ถูกสร้างจริง
+
+**บทเรียน:** behavior gate ที่เพิ่มเข้า shared dispatch function (เช่น
+`_exploit_msf`, `_classify_oracle`, `INSTALL_METHOD_DISPATCH`) ต้อง opt-in ต่อ
+CVE ผ่าน config field ที่ชัดเจนเสมอ ห้ามสมมติว่า "ถ้า field ไม่มี = false/fail"
+ในกรณีที่ field ไม่มีควรแปลว่า "feature นี้ไม่เกี่ยวกับ CVE นี้ ใช้ behavior เดิม"
+แทน — และต้อง regression-test ฝั่งที่ **ไม่ได้** ใช้ feature ใหม่ด้วยเสมอ ไม่ใช่
+แค่ฝั่งที่ตั้งใจแก้

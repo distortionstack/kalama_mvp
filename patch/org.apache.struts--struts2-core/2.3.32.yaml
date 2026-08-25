@@ -1,0 +1,58 @@
+# patch/org.apache.struts:struts2-core/2.3.32.yaml
+#
+# หน้าที่: เก็บข้อมูล "จะอัปเดต dependency นี้ไปเวอร์ชันนี้ยังไง" เท่านั้น
+# ไฟล์นี้ไม่รู้จัก CVE ใดๆ ทั้งสิ้น — updater code อ่านแค่ dependency+version
+
+dependency: org.apache.struts:struts2-core
+ecosystem: maven
+
+# --- multi-branch FixedVersion จาก Trivy — same-branch selection policy ---
+# Trivy scan จริง (vulhub/struts2:2.3.30) คืน FixedVersion เป็น 2 ค่า:
+#   "2.3.32, 2.5.10.1"   ← multi-branch (คนละ major.minor line กัน)
+# เลือกใช้ "2.3.32" (same-branch กับ installed version 2.3.30) ตาม policy เดิม
+# ที่ตกลงกันไว้ตอน CVE-2015-1427: ลองทุก candidate ตามลำดับที่ Trivy คืนมา
+# (check_adapter_coverage ใน scoring.py) — "2.3.32" มาก่อน "2.5.10.1" ในลำดับ
+# ของ Trivy อยู่แล้ว จึงถูกเลือกเป็นตัวแรกที่มี patch config จริงพอดี ไม่ต้อง
+# เดา/กำหนดลำดับเพิ่มเติมในไฟล์นี้ — ยืนยันจริงจาก lab note "Kalama lab note
+# cve2017 5638.md" §4 ว่า 2.3.32 ทำงานจริง (re-exploit หลัง patch FAIL ตามคาด)
+fixed_version: "2.3.32"
+
+fixed_version_strategy:
+  # fix_type A (build_from_source) — install_method นี้ "build_from_source"
+  # ยังไม่มี handler จริงใน INSTALL_METHOD_DISPATCH (update.py) เลย — ดู
+  # AGENT_README ข้อ 1-2 ที่ flag ไว้แล้วว่าเป็น stub รอ port มาจาก
+  # patch_stage.py เดิม (tier_1/tier_2 split)
+  #
+  # เหตุผลที่ต้องเป็น build_from_source (ยืนยันจาก lab note §6.1):
+  #   vulhub/struts2:2.3.32 ไม่มีบน Docker Hub เลย (vulhub ไม่ push image
+  #   เวอร์ชัน patched) ต้อง build เองจาก source ที่ vulhub/base/struts2/2.3.30/
+  #   โดย refactor pom.xml (hardcode version -> ${struts2.version} property)
+  #   แล้ว mvn versions:set-property + mvn compile jetty:help ตาม Dockerfile
+  #   ARG STRUTS2_VERSION — ไม่ใช่แค่ curl+tar แบบ prebuilt_download เลย
+  #
+  # ปล่อยให้ _try_strategy() ของโค้ดจริง StopPipeline ด้วยตัวเอง (reason:
+  # "unsupported_install_method") แทนที่จะเดา-implement build logic ตรงนี้ —
+  # ไม่ใส่ upstream_fallback_strategy ด้วยเหตุผลเดียวกัน (ปัญหาคือ "ยังไม่มี
+  # handler" ไม่ใช่ "URL ตาย" การมี fallback strategy ไม่ช่วยอะไรเลยตอนนี้)
+  install_method: build_from_source
+  known_issue: >
+    vulhub/struts2:2.3.32 ไม่มีบน Docker Hub — ต้อง build จาก source
+    (vulhub/base/struts2/2.3.30/ + pom.xml refactor + Dockerfile ARG
+    STRUTS2_VERSION) รายละเอียดเต็มดู lab note §6
+
+build:
+  base_image: maven:3-jdk-8   # ตาม Dockerfile จริงใน lab note §6.4 — struts2-showcase
+                               # packaging เป็น war รันด้วย jetty-maven-plugin
+                               # (mvn jetty:run) ไม่ใช่ fat-jar แบบ elasticsearch/log4j
+  # entrypoint/runtime_user ฯลฯ ยังไม่ใส่ตอนนี้ — ไปไม่ถึงขั้น build image เลย
+  # ด้วยซ้ำ เพราะ fail ตั้งแต่ install_method ยังไม่มี handler (ดูด้านบน)
+
+verified_case:
+  # cross-reference — ยืนยันว่า strategy นี้เคยรันผ่านจริงกับ CVE ไหน (manual,
+  # ไม่ใช่ผ่าน kalama pipeline อัตโนมัติ เพราะ build_from_source handler ยังไม่มี)
+  - cve_id: CVE-2017-5638
+    fallback_used: false   # ใช้ fixed_version_strategy ตรงๆ (2.3.32 same-branch) ไม่ต้อง fallback
+    actual_version_installed: "2.3.32"
+    lab_note_date: "2026-08-01"
+    jump_classification: same_branch_patch   # ต่างจาก CVE-2015-1427 (cross-major
+                                               # fallback) — นี่คือ minimal patch จริง
